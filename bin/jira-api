@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""jira-api — minimal Jira REST API v3 CLI.
+
+Credentials: ~/.config/jira/credentials.json
+  {"base_url": "https://acn-avs.atlassian.net", "email": "...", "token": "..."}
+
+Usage:
+  jira-api get AGENTIC-765
+  jira-api create --project AGENTIC --summary "..." [--type Story] [--description "..."] [--labels l1,l2] [--parent AGENTIC-765] [--fix-version 1.0] [--assignee me] [--sp-without-ai 3] [--story-points 3] [--actual-sp 3] [--team Agentic_Eng_Efficiency]
+  jira-api edit AGENTIC-765 [--labels needs-triage,ready-for-agent] [--summary "..."] [--assignee me] [--sp-without-ai 3] [--story-points 3] [--actual-sp 3] [--team Agentic_Eng_Efficiency] [--parent AGENTIC-2798]
+  jira-api labels AGENTIC-765
+  jira-api transition AGENTIC-765                       # list available transitions
+  jira-api transition AGENTIC-765 --to Done [--sp-without-ai 3]
+  jira-api transition AGENTIC-765 --id 31 [--sp-without-ai 3]
+  jira-api search --jql "project = AGENTIC AND status != Done" [--max 50]
+  jira-api plan --id 124 [--scenario 124] [--assignee me] [--include-done] [--backlog] [--json]
+  jira-api link --type Blocks --outward AGENTIC-10 --inward AGENTIC-20
+  jira-api log-work AGENTIC-765 --time "2h 30m" [--comment "fixed the thing"]
+  jira-api comment AGENTIC-765 --body "text of the comment"
+"""
+
+import argparse
+import base64
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CREDENTIALS_FILE = Path.home() / ".config" / "jira" / "credentials.json"
+
+# Custom-field ids discovered via GET /rest/api/3/field. 1 SP = 8 h of work.
+SP_WITHOUT_AI_FIELD = "customfield_10367"   # "SP without AI" — required by Start DEV gate
+STORY_POINTS_FIELD  = "customfield_10117"   # "Story Points" (Estimation & Effort section in UI)
+ACTUAL_SP_FIELD     = "customfield_10141"   # "Actual story points" — fill post-completion
+TEAM_FIELD          = "customfield_10001"   # "Team" — set to Agentic_Eng_Efficiency on every story
+
+TEAM_IDS: dict[str, str] = {
+    "Agentic_Eng_Efficiency": "66ba2239-7f55-4f1c-8257-7785fd549871",
+}
+
+
+def _sp_value(raw: str) -> float | int:
+    """Coerce a --sp-without-ai argument to a JSON number (int when whole)."""
+    try:
+        num = float(raw)
+    except ValueError:
+        sys.exit(f"error: --sp-without-ai must be a number, got {raw!r}")
+    return int(num) if num.is_integer() else num
+
+
+def _load_creds() -> dict:
+    try:
+        return json.loads(CREDENTIALS_FILE.read_text())
+    except FileNotFoundError:
+        sys.exit(
+            f"error: credentials file not found: {CREDENTIALS_FILE}\n"
+            f'Create it with: {{"base_url": "...", "email": "...", "token": "..."}}'
+        )
+    except json.JSONDecodeError as exc:
+        sys.exit(f"error: could not parse credentials file: {exc}")
+
+
+def _auth_header(creds: dict) -> str:
+    return "Basic " + base64.b64encode(
+        f"{creds['email']}:{creds['token']}".encode()
+    ).decode()
+
+
+def _request(creds: dict, method: str, path: str, body: dict | None = None) -> dict:
+    url = creds["base_url"].rstrip("/") + path
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {
+        "Authorization": _auth_header(creds),
+        "Accept": "application/json",
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode(errors="replace")
+        sys.exit(f"error: HTTP {exc.code} from Jira: {body_text[:400]}")
+    except urllib.error.URLError as exc:
+        sys.exit(f"error: could not reach Jira: {exc.reason}")
+
+
+def _resolve_assignee(creds: dict, value: str) -> str:
+    """Map an email (or 'me') to an accountId; pass an accountId through as-is."""
+    if value == "me":
+        return _request(creds, "GET", "/rest/api/3/myself")["accountId"]
+    if "@" not in value:
+        return value  # already an accountId
+    users = _request(creds, "GET", "/rest/api/3/user/search?query=" + urllib.parse.quote(value))
+    if not users:
+        sys.exit(f"error: no Jira user found for {value!r}")
+    return users[0]["accountId"]
+
+
+def _text_to_adf(text: str) -> dict:
+    """Wrap plain text in minimal Atlassian Document Format."""
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": text}],
+            }
+        ],
+    }
+
+
+def cmd_get(creds: dict, args) -> None:
+    result = _request(creds, "GET", f"/rest/api/3/issue/{args.key}")
+    print(json.dumps(result, indent=2))
+
+
+def cmd_create(creds: dict, args) -> None:
+    fields: dict = {
+        "project": {"key": args.project},
+        "summary": args.summary,
+        "issuetype": {"name": args.type},
+    }
+    if args.description:
+        fields["description"] = _text_to_adf(args.description)
+    if args.labels:
+        fields["labels"] = [lb.strip() for lb in args.labels.split(",")]
+    if args.parent:
+        fields["parent"] = {"key": args.parent}
+    if args.fix_version:
+        fields["fixVersions"] = [{"name": args.fix_version}]
+    if args.assignee:
+        fields["assignee"] = {"accountId": _resolve_assignee(creds, args.assignee)}
+    if args.sp_without_ai is not None:
+        fields[SP_WITHOUT_AI_FIELD] = _sp_value(args.sp_without_ai)
+    if args.story_points is not None:
+        fields[STORY_POINTS_FIELD] = _sp_value(args.story_points)
+    if args.actual_sp is not None:
+        fields[ACTUAL_SP_FIELD] = _sp_value(args.actual_sp)
+    if args.team is not None:
+        team_id = TEAM_IDS.get(args.team, args.team)
+        fields[TEAM_FIELD] = team_id
+    result = _request(creds, "POST", "/rest/api/3/issue", {"fields": fields})
+    print(json.dumps(result, indent=2))
+
+
+def cmd_link(creds: dict, args) -> None:
+    body = {
+        "type": {"name": args.type},
+        "outwardIssue": {"key": args.outward},
+        "inwardIssue": {"key": args.inward},
+    }
+    _request(creds, "POST", "/rest/api/3/issueLink", body)
+    print(f"linked {args.outward} -[{args.type}]-> {args.inward}")
+
+
+def cmd_edit(creds: dict, args) -> None:
+    fields: dict = {}
+    if args.labels is not None:
+        fields["labels"] = [lb.strip() for lb in args.labels.split(",")]
+    if args.summary is not None:
+        fields["summary"] = args.summary
+    if args.assignee is not None:
+        fields["assignee"] = {"accountId": _resolve_assignee(creds, args.assignee)}
+    if args.sp_without_ai is not None:
+        fields[SP_WITHOUT_AI_FIELD] = _sp_value(args.sp_without_ai)
+    if args.story_points is not None:
+        fields[STORY_POINTS_FIELD] = _sp_value(args.story_points)
+    if args.actual_sp is not None:
+        fields[ACTUAL_SP_FIELD] = _sp_value(args.actual_sp)
+    if args.team is not None:
+        team_id = TEAM_IDS.get(args.team, args.team)
+        fields[TEAM_FIELD] = team_id
+    if args.parent is not None:
+        fields["parent"] = {"key": args.parent}
+    if args.description is not None:
+        fields["description"] = _text_to_adf(args.description)
+    if not fields:
+        sys.exit("error: nothing to edit; pass at least one field option")
+    _request(creds, "PUT", f"/rest/api/3/issue/{args.key}", {"fields": fields})
+    print(f"updated {args.key}")
+
+
+def cmd_labels(creds: dict, args) -> None:
+    result = _request(
+        creds, "GET", f"/rest/api/3/issue/{args.key}?fields=labels"
+    )
+    labels = result.get("fields", {}).get("labels", [])
+    if args.json:
+        print(json.dumps(labels))
+    else:
+        for label in labels:
+            print(label)
+
+
+def cmd_transition(creds: dict, args) -> None:
+    available = _request(
+        creds, "GET", f"/rest/api/3/issue/{args.key}/transitions"
+    )["transitions"]
+
+    # No target given: list what's reachable from the current status.
+    if args.to is None and args.id is None:
+        for t in available:
+            print(f"{t['id']}\t{t['name']}\t-> {t['to']['name']}")
+        return
+
+    if args.id is not None:
+        match = next((t for t in available if t["id"] == args.id), None)
+        if match is None:
+            sys.exit(
+                f"error: no transition with id {args.id!r} from current status; "
+                f"available: {', '.join(t['id'] + ' (' + t['name'] + ')' for t in available)}"
+            )
+    else:
+        wanted = args.to.casefold()
+        # Match on the transition name first, then on the destination status.
+        match = next(
+            (t for t in available if t["name"].casefold() == wanted), None
+        ) or next(
+            (t for t in available if t["to"]["name"].casefold() == wanted), None
+        )
+        if match is None:
+            sys.exit(
+                f"error: no transition matching {args.to!r} from current status; "
+                f"available: {', '.join(t['name'] + ' -> ' + t['to']['name'] for t in available)}"
+            )
+
+    # "SP without AI" is a validator that must be set BEFORE the transition,
+    # but it lives on the edit screen — not the transition screen — so it
+    # cannot ride in the transition's `fields` payload. Set it via a normal
+    # edit first, then transition.
+    if args.sp_without_ai is not None:
+        _request(
+            creds, "PUT", f"/rest/api/3/issue/{args.key}",
+            {"fields": {SP_WITHOUT_AI_FIELD: _sp_value(args.sp_without_ai)}},
+        )
+    _request(
+        creds, "POST", f"/rest/api/3/issue/{args.key}/transitions",
+        {"transition": {"id": match["id"]}},
+    )
+    print(f"transitioned {args.key} via {match['name']!r} -> {match['to']['name']}")
+
+
+def cmd_log_work(creds: dict, args) -> None:
+    body: dict = {"timeSpent": args.time}
+    if args.comment:
+        body["comment"] = _text_to_adf(args.comment)
+    _request(creds, "POST", f"/rest/api/3/issue/{args.key}/worklog", body)
+    print(f"logged {args.time} on {args.key}")
+
+
+def cmd_comment(creds: dict, args) -> None:
+    body = {"body": _text_to_adf(args.body)}
+    result = _request(creds, "POST", f"/rest/api/3/issue/{args.key}/comment", body)
+    print(f"comment {result['id']} added to {args.key}")
+
+
+def cmd_search(creds: dict, args) -> None:
+    body = {
+        "jql": args.jql,
+        "maxResults": args.max,
+        "fields": ["summary", "status", "issuetype", "parent", "labels", "assignee", "priority"],
+    }
+    result = _request(creds, "POST", "/rest/api/3/search/jql", body)
+    print(json.dumps(result, indent=2))
+
+
+# Statuses whose category is "done" — used to hide completed work from the plan
+# view by default. Resolved dynamically from /rest/api/3/status.
+def _done_status_ids(creds: dict) -> set[str]:
+    done: set[str] = set()
+    for st in _request(creds, "GET", "/rest/api/3/status"):
+        cat = (st.get("statusCategory") or {}).get("key")
+        if cat == "done":
+            done.add(str(st["id"]))
+    return done
+
+
+def _sprint_info(creds: dict, sprint_id: str, cache: dict) -> dict:
+    """Resolve a sprint id to {name, state, start, end} via the Agile API (cached)."""
+    if sprint_id in cache:
+        return cache[sprint_id]
+    try:
+        s = _request(creds, "GET", f"/rest/agile/1.0/sprint/{sprint_id}")
+        info = {
+            "name": s.get("name", sprint_id),
+            "state": s.get("state", "?"),
+            "start": (s.get("startDate") or "")[:10],
+            "end": (s.get("endDate") or "")[:10],
+        }
+    except SystemExit:
+        info = {"name": sprint_id, "state": "?", "start": "", "end": ""}
+    cache[sprint_id] = info
+    return info
+
+
+def cmd_plan(creds: dict, args) -> None:
+    """Read an Advanced Roadmaps plan timeline via the internal jpo API.
+
+    The public Plans API (/rest/api/3/plans/plan) needs the Administer Jira
+    global permission; the jpo API only needs plan access, so it is what a
+    normal user token can read. Timeline placement in this plan is
+    sprint-inferred (issueInferredDateSelection), so issues are grouped by
+    their scenario sprint and ordered within a sprint by lexoRank.
+    """
+    scenario = args.scenario if args.scenario is not None else args.id
+    plan = _request(creds, "GET", f"/rest/jpo/1.0/plans/{args.id}")
+    backlog = _request(
+        creds, "POST", "/rest/jpo/1.0/backlog",
+        {"planId": int(args.id), "scenarioId": int(scenario)},
+    )
+    issues = backlog.get("issues", [])
+
+    # Optional assignee filter.
+    if args.assignee:
+        acct = _resolve_assignee(creds, args.assignee)
+        issues = [i for i in issues if i["jiraValues"].get("assignee") == acct]
+
+    # Hide done issues unless asked otherwise.
+    if not args.include_done:
+        done_ids = _done_status_ids(creds)
+        issues = [i for i in issues if str(i["jiraValues"].get("status")) not in done_ids]
+
+    # Resolve the project key prefix (jpo returns bare numeric issue keys).
+    proj_by_id: dict[str, str] = {}
+    for p in _request(creds, "GET", "/rest/api/3/project/search?maxResults=100").get("values", []):
+        proj_by_id[str(p["id"])] = p["key"]
+
+    # Resolve status / issuetype ids to names for readability.
+    status_name = {str(s["id"]): s["name"] for s in _request(creds, "GET", "/rest/api/3/status")}
+    type_name = {str(t["id"]): t["name"] for t in _request(creds, "GET", "/rest/api/3/issuetype")}
+
+    def render(i: dict) -> dict:
+        jv = i["jiraValues"]
+        proj = proj_by_id.get(str(jv.get("project")), "?")
+        return {
+            "key": f"{proj}-{i['issueKey']}",
+            "summary": jv.get("summary", ""),
+            "status": status_name.get(str(jv.get("status")), str(jv.get("status"))),
+            "type": type_name.get(str(jv.get("type")), str(jv.get("type"))),
+            "storyPoints": jv.get("storyPoints"),
+            "sprint": jv.get("sprint"),
+            "lexoRank": jv.get("lexoRank", ""),
+        }
+
+    rendered = [render(i) for i in issues]
+
+    if args.json:
+        print(json.dumps(rendered, indent=2))
+        return
+
+    # Group by sprint; unscheduled last. Order sprint groups by start date.
+    sprint_cache: dict = {}
+    by_sprint: dict = {}
+    for r in rendered:
+        by_sprint.setdefault(r["sprint"], []).append(r)
+
+    scheduled = [sid for sid in by_sprint if sid]
+    scheduled_info = {sid: _sprint_info(creds, sid, sprint_cache) for sid in scheduled}
+    scheduled.sort(key=lambda sid: (scheduled_info[sid]["start"] or "9999", scheduled_info[sid]["name"]))
+
+    unit = plan.get("planningUnit", "")
+    print(f"Plan {plan.get('id')} — {plan.get('title')}  (planning unit: {unit})")
+    filt = []
+    if args.assignee:
+        filt.append(f"assignee={args.assignee}")
+    filt.append("done hidden" if not args.include_done else "done included")
+    print(f"Filter: {', '.join(filt)}\n")
+
+    for sid in scheduled:
+        info = scheduled_info[sid]
+        rows = sorted(by_sprint[sid], key=lambda r: r["lexoRank"])
+        window = f"{info['start']} → {info['end']}" if info["start"] else "(no dates)"
+        print(f"▸ {info['name']}  ({window})  [{info['state']}]  — {len(rows)} issue(s)")
+        for r in rows:
+            sp = f"{r['storyPoints']}sp" if r["storyPoints"] is not None else "—"
+            print(f"    {r['key']:<16} [{r['status']:<14}] {sp:>6}  {r['summary']}")
+        print()
+
+    unscheduled = by_sprint.get(None, [])
+    if unscheduled:
+        if args.backlog:
+            rows = sorted(unscheduled, key=lambda r: r["lexoRank"])
+            print(f"▸ Backlog (no sprint) — {len(rows)} issue(s)")
+            for r in rows:
+                sp = f"{r['storyPoints']}sp" if r["storyPoints"] is not None else "—"
+                print(f"    {r['key']:<16} [{r['status']:<14}] {sp:>6}  {r['summary']}")
+        else:
+            print(f"▸ Backlog (no sprint) — {len(unscheduled)} issue(s)  (use --backlog to list)")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="jira-api",
+        description="Minimal Jira REST v3 CLI. Reads credentials from ~/.config/jira/credentials.json.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_get = sub.add_parser("get", help="Fetch a single issue.")
+    p_get.add_argument("key", help="Issue key, e.g. AGENTIC-765.")
+
+    p_create = sub.add_parser("create", help="Create a new issue.")
+    p_create.add_argument("--project", required=True, help="Project key, e.g. AGENTIC.")
+    p_create.add_argument("--summary", required=True)
+    p_create.add_argument("--type", default="Story", dest="type", help="Issue type (default: Story).")
+    p_create.add_argument("--description", default=None, help="Plain text; wrapped in ADF automatically.")
+    p_create.add_argument("--labels", default=None, help="Comma-separated labels.")
+    p_create.add_argument("--parent", default=None,
+                          help="Parent issue key (the Epic for a Story; the umbrella issue for an Epic).")
+    p_create.add_argument("--fix-version", default=None, dest="fix_version",
+                          help="Fix version name, e.g. 1.0 (required by some projects).")
+    p_create.add_argument("--assignee", default=None,
+                          help="Assignee: an email, an accountId, or 'me' (the token owner).")
+    p_create.add_argument("--sp-without-ai", default=None, dest="sp_without_ai",
+                          help='Set the "SP without AI" number field (1 SP = 8 h).')
+    p_create.add_argument("--story-points", default=None, dest="story_points",
+                          help='Set the story point estimate (with AI). 1 SP = 8 h.')
+    p_create.add_argument("--actual-sp", default=None, dest="actual_sp",
+                          help='Set actual story points (fill post-completion). 1 SP = 8 h.')
+    p_create.add_argument("--team", default=None,
+                          help='Set the Team field. Use a team name (e.g. Agentic_Eng_Efficiency) or a raw team UUID.')
+
+    p_edit = sub.add_parser("edit", help="Update an existing issue.")
+    p_edit.add_argument("key", help="Issue key.")
+    p_edit.add_argument("--labels", default=None, help="Comma-separated labels (replaces all existing).")
+    p_edit.add_argument("--summary", default=None)
+    p_edit.add_argument("--assignee", default=None,
+                        help="Assignee: an email, an accountId, or 'me' (the token owner).")
+    p_edit.add_argument("--sp-without-ai", default=None, dest="sp_without_ai",
+                        help='Set the "SP without AI" number field (1 SP = 8 h).')
+    p_edit.add_argument("--story-points", default=None, dest="story_points",
+                        help='Set the story point estimate (with AI). 1 SP = 8 h.')
+    p_edit.add_argument("--actual-sp", default=None, dest="actual_sp",
+                        help='Set actual story points (fill post-completion). 1 SP = 8 h.')
+    p_edit.add_argument("--team", default=None,
+                        help='Set the Team field. Use a team name (e.g. Agentic_Eng_Efficiency) or a raw team UUID.')
+    p_edit.add_argument("--parent", default=None, help="Re-parent the issue under this key.")
+    p_edit.add_argument("--description", default=None, help="Replace the issue description (plain text, converted to ADF).")
+
+    p_labels = sub.add_parser("labels", help="Print an issue's labels.")
+    p_labels.add_argument("key", help="Issue key.")
+    p_labels.add_argument("--json", action="store_true",
+                          help="Print as a JSON array instead of one label per line.")
+
+    p_transition = sub.add_parser(
+        "transition", help="List or apply workflow transitions for an issue."
+    )
+    p_transition.add_argument("key", help="Issue key.")
+    p_transition.add_argument("--to", default=None,
+                              help="Target transition or status name (case-insensitive). Omit to list.")
+    p_transition.add_argument("--id", default=None,
+                              help="Target transition id (alternative to --to).")
+    p_transition.add_argument("--sp-without-ai", default=None, dest="sp_without_ai",
+                              help='Set the "SP without AI" field (via edit) before transitioning. '
+                                   "Some transitions (e.g. Start DEV) require it.")
+
+    p_log_work = sub.add_parser("log-work", help="Log time worked on an issue.")
+    p_log_work.add_argument("key", help="Issue key.")
+    p_log_work.add_argument("--time", required=True,
+                            help='Time spent in Jira format, e.g. "1h", "30m", "2h 30m".')
+    p_log_work.add_argument("--comment", default=None, help="Optional worklog comment.")
+
+    p_comment = sub.add_parser("comment", help="Add a comment to an issue.")
+    p_comment.add_argument("key", help="Issue key.")
+    p_comment.add_argument("--body", required=True, help="Comment text.")
+
+    p_search = sub.add_parser("search", help="Search issues by JQL.")
+    p_search.add_argument("--jql", required=True)
+    p_search.add_argument("--max", type=int, default=50, help="Max results (default: 50).")
+
+    p_plan = sub.add_parser(
+        "plan", help="Read an Advanced Roadmaps plan timeline (grouped by sprint)."
+    )
+    p_plan.add_argument("--id", required=True, help="Plan id, e.g. 124.")
+    p_plan.add_argument("--scenario", default=None,
+                        help="Scenario id (defaults to the plan id).")
+    p_plan.add_argument("--assignee", default=None,
+                        help="Filter to an assignee: an email, an accountId, or 'me'.")
+    p_plan.add_argument("--include-done", action="store_true", dest="include_done",
+                        help="Include issues in a done status (hidden by default).")
+    p_plan.add_argument("--backlog", action="store_true",
+                        help="Also list the unscheduled backlog (issues with no sprint).")
+    p_plan.add_argument("--json", action="store_true",
+                        help="Print the filtered issues as JSON instead of a grouped table.")
+
+    p_link = sub.add_parser("link", help="Create an issue link between two issues.")
+    p_link.add_argument("--type", required=True, dest="type",
+                        help='Link type name, e.g. "Blocks" or "Relates".')
+    p_link.add_argument("--outward", required=True,
+                        help='Outward issue key (for "Blocks", the blocker).')
+    p_link.add_argument("--inward", required=True,
+                        help='Inward issue key (for "Blocks", the blocked issue).')
+
+    args = parser.parse_args()
+    creds = _load_creds()
+
+    {
+        "get": cmd_get,
+        "create": cmd_create,
+        "edit": cmd_edit,
+        "labels": cmd_labels,
+        "transition": cmd_transition,
+        "search": cmd_search,
+        "plan": cmd_plan,
+        "link": cmd_link,
+        "log-work": cmd_log_work,
+        "comment": cmd_comment,
+    }[args.command](creds, args)
+
+
+if __name__ == "__main__":
+    main()

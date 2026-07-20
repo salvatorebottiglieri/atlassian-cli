@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""tempo-api — Tempo Timesheets CLI for Jira Cloud.
+
+Credentials: ~/.config/tempo/credentials.json
+  {
+    "jira_base_url": "https://infocube.atlassian.net",
+    "email": "salvatore.bottiglieri@infocube.it",
+    "jira_token": "<Atlassian API token for infocube>",
+    "tempo_token": "<Tempo API token>"
+  }
+
+Usage:
+  tempo-api log PROJ-123 --time "2h 30m" [--date 2026-07-20] [--comment "..."]
+  tempo-api worklogs PROJ-123 [--from 2026-07-01] [--to 2026-07-20] [--json]
+  tempo-api my-worklogs [--from 2026-07-01] [--to 2026-07-20] [--json]
+  tempo-api delete <worklog-id>
+"""
+
+import argparse
+import base64
+import json
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, timedelta
+from pathlib import Path
+
+CREDENTIALS_FILE = Path.home() / ".config" / "tempo" / "credentials.json"
+TEMPO_BASE = "https://api.tempo.io/4"
+
+
+def _load_creds() -> dict:
+    try:
+        return json.loads(CREDENTIALS_FILE.read_text())
+    except FileNotFoundError:
+        sys.exit(
+            f"error: credentials file not found: {CREDENTIALS_FILE}\n"
+            f"Create it with:\n"
+            f'  {{"jira_base_url": "https://infocube.atlassian.net", '
+            f'"email": "...", "jira_token": "...", "tempo_token": "..."}}'
+        )
+    except json.JSONDecodeError as exc:
+        sys.exit(f"error: could not parse credentials file: {exc}")
+
+
+def _jira_request(creds: dict, method: str, path: str, body: dict | None = None) -> dict:
+    url = creds["jira_base_url"].rstrip("/") + path
+    data = json.dumps(body).encode() if body is not None else None
+    token = base64.b64encode(f"{creds['email']}:{creds['jira_token']}".encode()).decode()
+    headers = {"Authorization": f"Basic {token}", "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode(errors="replace")
+        sys.exit(f"error: HTTP {exc.code} from Jira: {body_text[:400]}")
+    except urllib.error.URLError as exc:
+        sys.exit(f"error: could not reach Jira: {exc.reason}")
+
+
+def _tempo_request(
+    creds: dict,
+    method: str,
+    path: str,
+    body: dict | None = None,
+    params: dict | None = None,
+) -> dict:
+    url = TEMPO_BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {
+        "Authorization": f"Bearer {creds['tempo_token']}",
+        "Accept": "application/json",
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode(errors="replace")
+        sys.exit(f"error: HTTP {exc.code} from Tempo: {body_text[:400]}")
+    except urllib.error.URLError as exc:
+        sys.exit(f"error: could not reach Tempo: {exc.reason}")
+
+
+def _parse_time(time_str: str) -> int:
+    """Parse '2h 30m', '1h', '45m' into total seconds."""
+    total = 0
+    h = re.search(r"(\d+(?:\.\d+)?)\s*h", time_str)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*m", time_str)
+    if h:
+        total += int(float(h.group(1)) * 3600)
+    if m:
+        total += int(float(m.group(1)) * 60)
+    if total == 0:
+        sys.exit(f"error: cannot parse time {time_str!r}; use '2h', '30m', or '2h 30m'")
+    return total
+
+
+def _fmt_seconds(s: int) -> str:
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    if h and m:
+        return f"{h}h {m}m"
+    return f"{h}h" if h else f"{m}m"
+
+
+def _resolve_issue_id(creds: dict, key: str) -> int:
+    """Resolve an issue key (e.g. PROJ-123) to its numeric Jira id."""
+    result = _jira_request(creds, "GET", f"/rest/api/3/issue/{key}?fields=id")
+    return int(result["id"])
+
+
+def _resolve_issue_keys(creds: dict, issue_ids: list[int]) -> dict[int, str]:
+    """Resolve a list of numeric issue ids to their keys (batched, cached)."""
+    key_map: dict[int, str] = {}
+    for iid in set(issue_ids):
+        result = _jira_request(creds, "GET", f"/rest/api/3/issue/{iid}?fields=summary")
+        key_map[iid] = result.get("key", str(iid))
+    return key_map
+
+
+def _my_account_id(creds: dict) -> str:
+    return _jira_request(creds, "GET", "/rest/api/3/myself")["accountId"]
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_log(creds: dict, args) -> None:
+    seconds = _parse_time(args.time)
+    log_date = args.date or date.today().isoformat()
+    issue_id = _resolve_issue_id(creds, args.key)
+    account_id = _my_account_id(creds)
+
+    body: dict = {
+        "issueId": issue_id,
+        "timeSpentSeconds": seconds,
+        "startDate": log_date,
+        "authorAccountId": account_id,
+    }
+    if args.comment:
+        body["description"] = args.comment
+
+    result = _tempo_request(creds, "POST", "/worklogs", body)
+    wid = result.get("tempoWorklogId", "?")
+    print(f"logged {_fmt_seconds(seconds)} on {args.key} (worklog id: {wid})")
+
+
+def cmd_worklogs(creds: dict, args) -> None:
+    issue_id = _resolve_issue_id(creds, args.key)
+    params: dict = {"issue": issue_id, "limit": 200}
+    if args.from_date:
+        params["from"] = args.from_date
+    if args.to_date:
+        params["to"] = args.to_date
+
+    result = _tempo_request(creds, "GET", "/worklogs", params=params)
+    entries = result.get("results", [])
+
+    if args.json:
+        print(json.dumps(entries, indent=2))
+        return
+
+    if not entries:
+        print("no worklogs found")
+        return
+
+    total = 0
+    for e in entries:
+        t = e.get("timeSpentSeconds", 0)
+        total += t
+        desc = e.get("description", "")
+        print(f"{e.get('startDate','?')}  {_fmt_seconds(t):>8}  {args.key:<16}  {desc}")
+    print(f"{'':>42}  {_fmt_seconds(total)}  total")
+
+
+def cmd_my_worklogs(creds: dict, args) -> None:
+    account_id = _my_account_id(creds)
+    from_date = args.from_date or (date.today() - timedelta(days=7)).isoformat()
+    to_date = args.to_date or date.today().isoformat()
+
+    params = {"from": from_date, "to": to_date, "limit": 200}
+    result = _tempo_request(creds, "GET", f"/worklogs/user/{account_id}", params=params)
+    entries = result.get("results", [])
+
+    if args.json:
+        print(json.dumps(entries, indent=2))
+        return
+
+    if not entries:
+        print(f"no worklogs for {from_date} → {to_date}")
+        return
+
+    issue_ids = [e["issue"]["id"] for e in entries if e.get("issue")]
+    key_map = _resolve_issue_keys(creds, issue_ids)
+
+    total = 0
+    for e in entries:
+        t = e.get("timeSpentSeconds", 0)
+        total += t
+        iid = (e.get("issue") or {}).get("id")
+        issue_key = key_map.get(iid, str(iid) if iid else "?")
+        desc = e.get("description", "")
+        print(f"{e.get('startDate','?')}  {_fmt_seconds(t):>8}  {issue_key:<16}  {desc}")
+    print(f"{'':>42}  {_fmt_seconds(total)}  total")
+
+
+def cmd_delete(creds: dict, args) -> None:
+    _tempo_request(creds, "DELETE", f"/worklogs/{args.worklog_id}")
+    print(f"deleted worklog {args.worklog_id}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="tempo-api",
+        description="Tempo Timesheets CLI. Reads credentials from ~/.config/tempo/credentials.json.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_log = sub.add_parser("log", help="Log time on an issue.")
+    p_log.add_argument("key", help="Issue key, e.g. PROJ-123.")
+    p_log.add_argument("--time", required=True,
+                       help='Time spent, e.g. "2h", "30m", "2h 30m".')
+    p_log.add_argument("--date", default=None,
+                       help="Date of the worklog (YYYY-MM-DD). Defaults to today.")
+    p_log.add_argument("--comment", default=None, help="Optional worklog description.")
+
+    p_wl = sub.add_parser("worklogs", help="List worklogs for an issue.")
+    p_wl.add_argument("key", help="Issue key, e.g. PROJ-123.")
+    p_wl.add_argument("--from", default=None, dest="from_date", metavar="DATE",
+                      help="Start date (YYYY-MM-DD).")
+    p_wl.add_argument("--to", default=None, dest="to_date", metavar="DATE",
+                      help="End date (YYYY-MM-DD).")
+    p_wl.add_argument("--json", action="store_true", help="Print raw JSON.")
+
+    p_my = sub.add_parser("my-worklogs", help="List my worklogs in a date range.")
+    p_my.add_argument("--from", default=None, dest="from_date", metavar="DATE",
+                      help="Start date (YYYY-MM-DD). Default: 7 days ago.")
+    p_my.add_argument("--to", default=None, dest="to_date", metavar="DATE",
+                      help="End date (YYYY-MM-DD). Default: today.")
+    p_my.add_argument("--json", action="store_true", help="Print raw JSON.")
+
+    p_del = sub.add_parser("delete", help="Delete a worklog by its Tempo id.")
+    p_del.add_argument("worklog_id", type=int, help="Tempo worklog id.")
+
+    args = parser.parse_args()
+    creds = _load_creds()
+
+    {
+        "log": cmd_log,
+        "worklogs": cmd_worklogs,
+        "my-worklogs": cmd_my_worklogs,
+        "delete": cmd_delete,
+    }[args.command](creds, args)
+
+
+if __name__ == "__main__":
+    main()
