@@ -150,6 +150,9 @@ def cmd_log(creds: dict, args) -> None:
         "startDate": log_date,
         "authorAccountId": account_id,
     }
+    if args.start_time:
+        t = args.start_time
+        body["startTime"] = t if len(t) == 8 else t + ":00"
     if args.comment:
         body["description"] = args.comment
 
@@ -239,6 +242,8 @@ def main() -> None:
                        help='Time spent, e.g. "2h", "30m", "2h 30m".')
     p_log.add_argument("--date", default=None,
                        help="Date of the worklog (YYYY-MM-DD). Defaults to today.")
+    p_log.add_argument("--start-time", default=None, dest="start_time", metavar="HH:MM",
+                       help="Start time of the worklog, e.g. 08:30.")
     p_log.add_argument("--comment", default=None, help="Optional worklog description.")
 
     p_wl = sub.add_parser("worklogs", help="List worklogs for an issue.")
