@@ -138,6 +138,16 @@ def _my_account_id(creds: dict) -> str:
 # Commands
 # ---------------------------------------------------------------------------
 
+def _schedule(creds: dict) -> dict:
+    """Return the work schedule fields from credentials, all optional."""
+    return {
+        "work_start":   creds.get("work_start"),
+        "lunch_start":  creds.get("lunch_start"),
+        "lunch_end":    creds.get("lunch_end"),
+        "work_end":     creds.get("work_end"),
+    }
+
+
 def cmd_log(creds: dict, args) -> None:
     seconds = _parse_time(args.time)
     log_date = args.date or date.today().isoformat()
@@ -150,15 +160,41 @@ def cmd_log(creds: dict, args) -> None:
         "startDate": log_date,
         "authorAccountId": account_id,
     }
-    if args.start_time:
-        t = args.start_time
-        body["startTime"] = t if len(t) == 8 else t + ":00"
+    start_time = args.start_time or _schedule(creds)["work_start"]
+    if start_time:
+        body["startTime"] = start_time if len(start_time) == 8 else start_time + ":00"
     if args.comment:
         body["description"] = args.comment
 
     result = _tempo_request(creds, "POST", "/worklogs", body)
     wid = result.get("tempoWorklogId", "?")
     print(f"logged {_fmt_seconds(seconds)} on {args.key} (worklog id: {wid})")
+
+
+def cmd_schedule(creds: dict, args) -> None:
+    sched = _schedule(creds)
+    if args.json:
+        print(json.dumps(sched, indent=2))
+        return
+    if not any(sched.values()):
+        print("no schedule configured — add work_start/lunch_start/lunch_end/work_end to credentials.json")
+        return
+    ws  = sched["work_start"]  or "—"
+    ls  = sched["lunch_start"] or "—"
+    le  = sched["lunch_end"]   or "—"
+    we  = sched["work_end"]    or "—"
+    print(f"work_start:   {ws}")
+    print(f"lunch_start:  {ls}")
+    print(f"lunch_end:    {le}")
+    print(f"work_end:     {we}")
+    # compute daily billable hours if all fields are set
+    if all(sched.values()):
+        def to_min(t: str) -> int:
+            h, m = t.split(":")
+            return int(h) * 60 + int(m)
+        total = to_min(we) - to_min(ws) - (to_min(le) - to_min(ls))
+        h, m = divmod(total, 60)
+        print(f"daily hours:  {_fmt_seconds(total * 60)}")
 
 
 def cmd_worklogs(creds: dict, args) -> None:
@@ -264,6 +300,9 @@ def main() -> None:
     p_del = sub.add_parser("delete", help="Delete a worklog by its Tempo id.")
     p_del.add_argument("worklog_id", type=int, help="Tempo worklog id.")
 
+    p_sched = sub.add_parser("schedule", help="Show the configured work schedule.")
+    p_sched.add_argument("--json", action="store_true", help="Print as JSON.")
+
     args = parser.parse_args()
     creds = _load_creds()
 
@@ -272,6 +311,7 @@ def main() -> None:
         "worklogs": cmd_worklogs,
         "my-worklogs": cmd_my_worklogs,
         "delete": cmd_delete,
+        "schedule": cmd_schedule,
     }[args.command](creds, args)
 
 
