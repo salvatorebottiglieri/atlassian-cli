@@ -6,8 +6,8 @@ Credentials: ~/.config/jira/credentials.json
 
 Usage:
   jira-api get AGENTIC-765
-  jira-api create --project AGENTIC --summary "..." [--type Story] [--description "..."] [--labels l1,l2] [--parent AGENTIC-765] [--fix-version 1.0] [--assignee me] [--sp-without-ai 3] [--story-points 3] [--actual-sp 3] [--team Agentic_Eng_Efficiency]
-  jira-api edit AGENTIC-765 [--labels needs-triage,ready-for-agent] [--summary "..."] [--assignee me] [--sp-without-ai 3] [--story-points 3] [--actual-sp 3] [--team Agentic_Eng_Efficiency] [--parent AGENTIC-2798]
+  jira-api create --project AGENTIC --summary "..." [--type Story] [--description "..."] [--labels l1,l2] [--parent AGENTIC-765] [--fix-version 1.0] [--assignee me] [--sp-without-ai 3] [--story-points 3] [--actual-sp 3] [--team Agentic_Eng_Efficiency] [--sprint active|next|<name>|<id>]
+  jira-api edit AGENTIC-765 [--labels needs-triage,ready-for-agent] [--summary "..."] [--assignee me] [--sp-without-ai 3] [--story-points 3] [--actual-sp 3] [--team Agentic_Eng_Efficiency] [--parent AGENTIC-2798] [--sprint active|next|<name>|<id>]
   jira-api labels AGENTIC-765
   jira-api transition AGENTIC-765                       # list available transitions
   jira-api transition AGENTIC-765 --to Done [--sp-without-ai 3]
@@ -35,6 +35,8 @@ SP_WITHOUT_AI_FIELD = "customfield_10367"   # "SP without AI" — required by St
 STORY_POINTS_FIELD  = "customfield_10117"   # "Story Points" (Estimation & Effort section in UI)
 ACTUAL_SP_FIELD     = "customfield_10141"   # "Actual story points" — fill post-completion
 TEAM_FIELD          = "customfield_10001"   # "Team" — set to Agentic_Eng_Efficiency on every story
+
+SPRINT_FIELD = "customfield_10020"
 
 TEAM_IDS: dict[str, str] = {
     "Agentic_Eng_Efficiency": "66ba2239-7f55-4f1c-8257-7785fd549871",
@@ -115,6 +117,62 @@ def _text_to_adf(text: str) -> dict:
     }
 
 
+def _board_id_for_project(creds: dict, project: str) -> int:
+    """Return the first Agile board id for the given project key."""
+    result = _request(creds, "GET", f"/rest/agile/1.0/board?projectKeyOrId={urllib.parse.quote(project)}&maxResults=1")
+    values = result.get("values", [])
+    if not values:
+        sys.exit(f"error: no Agile board found for project {project!r}")
+    return values[0]["id"]
+
+
+def _resolve_sprint(creds: dict, value: str, project: str, board_id: int | None = None) -> int:
+    """Resolve 'active', 'next', a numeric id, or a sprint name to a sprint id.
+
+    Accepts:
+      - A plain integer string ("3672") → used as-is.
+      - "active" → the currently active sprint on the board.
+      - "next"   → the first future sprint on the board.
+      - Any other string → case-insensitive name match (exact first, then partial).
+
+    board_id overrides auto-discovery from project key.
+    """
+    if value.lstrip("-").isdigit():
+        return int(value)
+
+    board_id = board_id if board_id is not None else _board_id_for_project(creds, project)
+
+    sprints: list[dict] = []
+    start = 0
+    while True:
+        page = _request(creds, "GET", f"/rest/agile/1.0/board/{board_id}/sprint?startAt={start}&maxResults=50")
+        sprints.extend(page.get("values", []))
+        if page.get("isLast", True):
+            break
+        start += 50
+
+    if value == "active":
+        active = [s for s in sprints if s["state"] == "active"]
+        if not active:
+            sys.exit("error: no active sprint found on this board")
+        return active[0]["id"]
+
+    if value == "next":
+        future = [s for s in sprints if s["state"] == "future"]
+        if not future:
+            sys.exit("error: no future sprint found on this board")
+        return future[0]["id"]
+
+    wanted = value.casefold()
+    match = next((s for s in sprints if s["name"].casefold() == wanted), None)
+    if match is None:
+        match = next((s for s in sprints if wanted in s["name"].casefold()), None)
+    if match is None:
+        available = ", ".join(s["name"] for s in sprints[-10:])
+        sys.exit(f"error: sprint {value!r} not found. Recent sprints: {available}")
+    return match["id"]
+
+
 def cmd_get(creds: dict, args) -> None:
     result = _request(creds, "GET", f"/rest/api/3/issue/{args.key}")
     print(json.dumps(result, indent=2))
@@ -145,6 +203,9 @@ def cmd_create(creds: dict, args) -> None:
     if args.team is not None:
         team_id = TEAM_IDS.get(args.team, args.team)
         fields[TEAM_FIELD] = team_id
+    if args.sprint is not None:
+        sprint_id = _resolve_sprint(creds, args.sprint, args.project, board_id=args.board)
+        fields[SPRINT_FIELD] = sprint_id
     result = _request(creds, "POST", "/rest/api/3/issue", {"fields": fields})
     print(json.dumps(result, indent=2))
 
@@ -180,6 +241,10 @@ def cmd_edit(creds: dict, args) -> None:
         fields["parent"] = {"key": args.parent}
     if args.description is not None:
         fields["description"] = _text_to_adf(args.description)
+    if args.sprint is not None:
+        project = args.key.rsplit("-", 1)[0]
+        sprint_id = _resolve_sprint(creds, args.sprint, project, board_id=args.board)
+        fields[SPRINT_FIELD] = sprint_id
     if not fields:
         sys.exit("error: nothing to edit; pass at least one field option")
     _request(creds, "PUT", f"/rest/api/3/issue/{args.key}", {"fields": fields})
@@ -424,6 +489,10 @@ def main() -> None:
                           help='Set actual story points (fill post-completion). 1 SP = 8 h.')
     p_create.add_argument("--team", default=None,
                           help='Set the Team field. Use a team name (e.g. Agentic_Eng_Efficiency) or a raw team UUID.')
+    p_create.add_argument("--sprint", default=None,
+                          help='Assign to a sprint: a numeric sprint id, "active", "next", or a sprint name (case-insensitive, partial match accepted).')
+    p_create.add_argument("--board", default=None, type=int,
+                          help='Agile board id to use for sprint resolution (overrides auto-discovery from project key).')
 
     p_edit = sub.add_parser("edit", help="Update an existing issue.")
     p_edit.add_argument("key", help="Issue key.")
@@ -441,6 +510,10 @@ def main() -> None:
                         help='Set the Team field. Use a team name (e.g. Agentic_Eng_Efficiency) or a raw team UUID.')
     p_edit.add_argument("--parent", default=None, help="Re-parent the issue under this key.")
     p_edit.add_argument("--description", default=None, help="Replace the issue description (plain text, converted to ADF).")
+    p_edit.add_argument("--sprint", default=None,
+                        help='Move to a sprint: a numeric sprint id, "active", "next", or a sprint name (case-insensitive, partial match accepted).')
+    p_edit.add_argument("--board", default=None, type=int,
+                        help='Agile board id to use for sprint resolution (overrides auto-discovery from project key).')
 
     p_labels = sub.add_parser("labels", help="Print an issue's labels.")
     p_labels.add_argument("key", help="Issue key.")
