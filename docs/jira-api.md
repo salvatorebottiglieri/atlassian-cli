@@ -50,6 +50,7 @@ jira-api create \
 - `--story-points` sets the estimation field (planning); `--actual-sp` is for post-completion
 - `--sp-without-ai` is required by some workflow gates before starting development
 - `--team` accepts a team name (mapped to UUID internally) or a raw UUID
+- `--markdown` treats `--description` as markdown-lite (headings, `-` bullet lists, `**bold**`, `` `code` ``) and converts it to structured ADF; also available on `edit`, `comment` and `log-work`
 
 ---
 
@@ -137,6 +138,7 @@ jira-api link --type "Relates" --outward PROJ-10 --inward PROJ-20
 ```bash
 jira-api log-work PROJ-123 --time "2h 30m"
 jira-api log-work PROJ-123 --time "1h" --comment "fixed the regression"
+jira-api log-work PROJ-123 --time "45m" --date 2026-09-21   # backdate the worklog
 ```
 
 > For logging time to **Tempo Timesheets**, use [`tempo-api log`](tempo-api.md) instead.
@@ -147,4 +149,5 @@ jira-api log-work PROJ-123 --time "1h" --comment "fixed the regression"
 
 ```bash
 jira-api comment PROJ-123 --body "Investigated the issue — root cause is in the auth middleware."
+jira-api comment PROJ-123 --markdown --body $'## Findings\n- **root cause:** `auth.py:42`'
 ```

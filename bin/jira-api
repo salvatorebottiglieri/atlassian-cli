@@ -15,13 +15,15 @@ Usage:
   jira-api search --jql "project = AGENTIC AND status != Done" [--max 50]
   jira-api plan --id 124 [--scenario 124] [--assignee me] [--include-done] [--backlog] [--json]
   jira-api link --type Blocks --outward AGENTIC-10 --inward AGENTIC-20
-  jira-api log-work AGENTIC-765 --time "2h 30m" [--comment "fixed the thing"]
-  jira-api comment AGENTIC-765 --body "text of the comment"
+  jira-api log-work AGENTIC-765 --time "2h 30m" [--date 2026-09-21] [--comment "fixed the thing"]
+  jira-api comment AGENTIC-765 --body "text of the comment" [--markdown]
 """
 
 import argparse
 import base64
+import datetime as dt
 import json
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -117,6 +119,89 @@ def _text_to_adf(text: str) -> dict:
     }
 
 
+def _parse_inline(text: str) -> list[dict]:
+    """Parse **bold** and `code` spans into ADF text nodes with marks."""
+    nodes: list[dict] = []
+    pattern = re.compile(r'(`[^`\n]+`|\*\*[^*\n]+\*\*)')
+    pos = 0
+    for m in pattern.finditer(text):
+        if m.start() > pos:
+            nodes.append({"type": "text", "text": text[pos:m.start()]})
+        token = m.group(0)
+        if token.startswith("`"):
+            nodes.append({"type": "text", "text": token[1:-1], "marks": [{"type": "code"}]})
+        else:
+            nodes.append({"type": "text", "text": token[2:-2], "marks": [{"type": "strong"}]})
+        pos = m.end()
+    if pos < len(text):
+        nodes.append({"type": "text", "text": text[pos:]})
+    return nodes if nodes else [{"type": "text", "text": text}]
+
+
+def _markdown_to_adf(md: str) -> dict:
+    """Convert markdown-lite to Atlassian Document Format.
+
+    Supported constructs: headings (#–######), bullet lists (- or *),
+    paragraphs (blank-line-separated), **bold** and `code` inline marks.
+    Multiple consecutive non-special lines are joined into one paragraph
+    with hardBreak nodes between them.
+    """
+    content: list[dict] = []
+    lines = md.splitlines()
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        if not line.strip():
+            i += 1
+            continue
+
+        # Heading: # h1 … ###### h6
+        m = re.match(r'^(#{1,6}) (.*)', line)
+        if m:
+            content.append({
+                "type": "heading",
+                "attrs": {"level": len(m.group(1))},
+                "content": _parse_inline(m.group(2).strip()),
+            })
+            i += 1
+            continue
+
+        # Bullet list: collect consecutive "- " / "* " lines
+        if re.match(r'^[-*] ', line):
+            items: list[dict] = []
+            while i < len(lines) and re.match(r'^[-*] ', lines[i]):
+                items.append({
+                    "type": "listItem",
+                    "content": [{"type": "paragraph", "content": _parse_inline(lines[i][2:])}],
+                })
+                i += 1
+            content.append({"type": "bulletList", "content": items})
+            continue
+
+        # Paragraph: accumulate lines until blank / heading / list
+        para_lines: list[str] = []
+        while i < len(lines) and lines[i].strip() \
+                and not re.match(r'^#{1,6} ', lines[i]) \
+                and not re.match(r'^[-*] ', lines[i]):
+            para_lines.append(lines[i])
+            i += 1
+
+        if para_lines:
+            inline: list[dict] = []
+            for j, pl in enumerate(para_lines):
+                if j:
+                    inline.append({"type": "hardBreak"})
+                inline.extend(_parse_inline(pl))
+            content.append({"type": "paragraph", "content": inline})
+
+    if not content:
+        content.append({"type": "paragraph", "content": [{"type": "text", "text": ""}]})
+
+    return {"type": "doc", "version": 1, "content": content}
+
+
 def _board_id_for_project(creds: dict, project: str) -> int:
     """Return the first Agile board id for the given project key."""
     result = _request(creds, "GET", f"/rest/agile/1.0/board?projectKeyOrId={urllib.parse.quote(project)}&maxResults=1")
@@ -185,7 +270,9 @@ def cmd_create(creds: dict, args) -> None:
         "issuetype": {"name": args.type},
     }
     if args.description:
-        fields["description"] = _text_to_adf(args.description)
+        fields["description"] = (
+            _markdown_to_adf(args.description) if args.markdown else _text_to_adf(args.description)
+        )
     if args.labels:
         fields["labels"] = [lb.strip() for lb in args.labels.split(",")]
     if args.parent:
@@ -240,7 +327,9 @@ def cmd_edit(creds: dict, args) -> None:
     if args.parent is not None:
         fields["parent"] = {"key": args.parent}
     if args.description is not None:
-        fields["description"] = _text_to_adf(args.description)
+        fields["description"] = (
+            _markdown_to_adf(args.description) if args.markdown else _text_to_adf(args.description)
+        )
     if args.sprint is not None:
         project = args.key.rsplit("-", 1)[0]
         sprint_id = _resolve_sprint(creds, args.sprint, project, board_id=args.board)
@@ -311,17 +400,51 @@ def cmd_transition(creds: dict, args) -> None:
     print(f"transitioned {args.key} via {match['name']!r} -> {match['to']['name']}")
 
 
+def _jira_started(value: str) -> str:
+    """Normalise a user date/datetime into Jira's worklog 'started' format
+    (``yyyy-MM-ddTHH:mm:ss.SSSZ``). A bare date defaults to 09:00; a time with
+    no timezone is taken as local time and the local UTC offset is appended."""
+    text = value.strip().replace(" ", "T")
+    parsed = None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            parsed = dt.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if fmt == "%Y-%m-%d":
+            parsed = parsed.replace(hour=9)
+        break
+    if parsed is None:
+        try:
+            parsed = dt.datetime.fromisoformat(text)
+        except ValueError:
+            sys.exit(
+                f"error: could not parse --date {value!r}; "
+                "use YYYY-MM-DD or YYYY-MM-DDTHH:MM"
+            )
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()  # treat naive input as local time
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S.000%z")
+
+
 def cmd_log_work(creds: dict, args) -> None:
     body: dict = {"timeSpent": args.time}
+    if args.date:
+        body["started"] = _jira_started(args.date)
     if args.comment:
-        body["comment"] = _text_to_adf(args.comment)
-    _request(creds, "POST", f"/rest/api/3/issue/{args.key}/worklog", body)
-    print(f"logged {args.time} on {args.key}")
+        body["comment"] = (
+            _markdown_to_adf(args.comment) if args.markdown else _text_to_adf(args.comment)
+        )
+    result = _request(creds, "POST", f"/rest/api/3/issue/{args.key}/worklog", body)
+    dated = f" dated {body['started']}" if "started" in body else ""
+    wid = result.get("id") if isinstance(result, dict) else None
+    ref = f" (worklog {wid})" if wid else ""
+    print(f"logged {args.time} on {args.key}{dated}{ref}")
 
 
 def cmd_comment(creds: dict, args) -> None:
-    body = {"body": _text_to_adf(args.body)}
-    result = _request(creds, "POST", f"/rest/api/3/issue/{args.key}/comment", body)
+    adf = _markdown_to_adf(args.body) if args.markdown else _text_to_adf(args.body)
+    result = _request(creds, "POST", f"/rest/api/3/issue/{args.key}/comment", {"body": adf})
     print(f"comment {result['id']} added to {args.key}")
 
 
@@ -493,6 +616,8 @@ def main() -> None:
                           help='Assign to a sprint: a numeric sprint id, "active", "next", or a sprint name (case-insensitive, partial match accepted).')
     p_create.add_argument("--board", default=None, type=int,
                           help='Agile board id to use for sprint resolution (overrides auto-discovery from project key).')
+    p_create.add_argument("--markdown", action="store_true",
+                          help="Treat --description as markdown-lite (headings, bullet lists, **bold**, `code`).")
 
     p_edit = sub.add_parser("edit", help="Update an existing issue.")
     p_edit.add_argument("key", help="Issue key.")
@@ -514,6 +639,8 @@ def main() -> None:
                         help='Move to a sprint: a numeric sprint id, "active", "next", or a sprint name (case-insensitive, partial match accepted).')
     p_edit.add_argument("--board", default=None, type=int,
                         help='Agile board id to use for sprint resolution (overrides auto-discovery from project key).')
+    p_edit.add_argument("--markdown", action="store_true",
+                        help="Treat --description as markdown-lite (headings, bullet lists, **bold**, `code`).")
 
     p_labels = sub.add_parser("labels", help="Print an issue's labels.")
     p_labels.add_argument("key", help="Issue key.")
@@ -536,11 +663,19 @@ def main() -> None:
     p_log_work.add_argument("key", help="Issue key.")
     p_log_work.add_argument("--time", required=True,
                             help='Time spent in Jira format, e.g. "1h", "30m", "2h 30m".')
+    p_log_work.add_argument("--date", default=None,
+                            help='Backdate the worklog: "YYYY-MM-DD" (defaults to 09:00 local) '
+                                 'or "YYYY-MM-DDTHH:MM". Sets the Jira worklog start time; '
+                                 'omit to use now.')
     p_log_work.add_argument("--comment", default=None, help="Optional worklog comment.")
+    p_log_work.add_argument("--markdown", action="store_true",
+                            help="Parse --comment as markdown-lite.")
 
     p_comment = sub.add_parser("comment", help="Add a comment to an issue.")
     p_comment.add_argument("key", help="Issue key.")
     p_comment.add_argument("--body", required=True, help="Comment text.")
+    p_comment.add_argument("--markdown", action="store_true",
+                           help="Parse --body as markdown-lite (headings, bullet lists, **bold**, `code`).")
 
     p_search = sub.add_parser("search", help="Search issues by JQL.")
     p_search.add_argument("--jql", required=True)
