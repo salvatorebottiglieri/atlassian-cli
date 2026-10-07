@@ -43,13 +43,17 @@ jira-api create \
   [--story-points 3] \
   [--sp-without-ai 5] \
   [--actual-sp 2] \
-  [--team MyTeam]
+  [--team MyTeam] \
+  [--sprint active] \
+  [--board 561]
 ```
 
 - `--assignee` accepts an email, an accountId, or `me` (token owner)
 - `--story-points` sets the estimation field (planning); `--actual-sp` is for post-completion
 - `--sp-without-ai` is required by some workflow gates before starting development
 - `--team` accepts a team name (mapped to UUID internally) or a raw UUID
+- `--sprint` accepts a sprint id, `active`, `next`, or a sprint name (exact, then partial match); also available on `edit`
+- `--board` picks the Agile board used to resolve `--sprint`. Without it the board comes from `DEFAULT_BOARDS[project]`; a project not listed there must have exactly one scrum board, otherwise the command fails and lists the boards. `active` also fails if the board has several active sprints
 - `--markdown` treats `--description` as markdown-lite (headings, `-` bullet lists, `**bold**`, `` `code` ``) and converts it to structured ADF; also available on `edit`, `comment` and `log-work`
 
 ---

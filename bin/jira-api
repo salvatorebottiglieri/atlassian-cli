@@ -44,6 +44,12 @@ TEAM_IDS: dict[str, str] = {
     "Agentic_Eng_Efficiency": "66ba2239-7f55-4f1c-8257-7785fd549871",
 }
 
+# Board used for sprint resolution when --board is not given. AGENTIC has ~10
+# boards (SI Agentic, AVS M3, Operations, ...); ours is "Agentic Eng Efficiency".
+DEFAULT_BOARDS: dict[str, int] = {
+    "AGENTIC": 561,
+}
+
 
 def _sp_value(raw: str) -> float | int:
     """Coerce a --sp-without-ai argument to a JSON number (int when whole)."""
@@ -203,11 +209,21 @@ def _markdown_to_adf(md: str) -> dict:
 
 
 def _board_id_for_project(creds: dict, project: str) -> int:
-    """Return the first Agile board id for the given project key."""
-    result = _request(creds, "GET", f"/rest/agile/1.0/board?projectKeyOrId={urllib.parse.quote(project)}&maxResults=1")
+    """Return the Agile board id for the given project key.
+
+    DEFAULT_BOARDS wins; otherwise the project must have exactly one scrum
+    board — with several, picking the first one silently lands issues in
+    another team's sprint, so fail and list them instead.
+    """
+    if project in DEFAULT_BOARDS:
+        return DEFAULT_BOARDS[project]
+    result = _request(creds, "GET", f"/rest/agile/1.0/board?projectKeyOrId={urllib.parse.quote(project)}&type=scrum&maxResults=50")
     values = result.get("values", [])
     if not values:
-        sys.exit(f"error: no Agile board found for project {project!r}")
+        sys.exit(f"error: no scrum board found for project {project!r}")
+    if len(values) > 1:
+        boards = ", ".join(f"{b['id']} ({b['name']})" for b in values)
+        sys.exit(f"error: project {project!r} has several scrum boards, pass --board: {boards}")
     return values[0]["id"]
 
 
@@ -239,7 +255,10 @@ def _resolve_sprint(creds: dict, value: str, project: str, board_id: int | None 
     if value == "active":
         active = [s for s in sprints if s["state"] == "active"]
         if not active:
-            sys.exit("error: no active sprint found on this board")
+            sys.exit(f"error: no active sprint found on board {board_id}")
+        if len(active) > 1:
+            names = ", ".join(f"{s['id']} ({s['name']})" for s in active)
+            sys.exit(f"error: board {board_id} has several active sprints, pass the sprint id or name: {names}")
         return active[0]["id"]
 
     if value == "next":
@@ -615,7 +634,7 @@ def main() -> None:
     p_create.add_argument("--sprint", default=None,
                           help='Assign to a sprint: a numeric sprint id, "active", "next", or a sprint name (case-insensitive, partial match accepted).')
     p_create.add_argument("--board", default=None, type=int,
-                          help='Agile board id to use for sprint resolution (overrides auto-discovery from project key).')
+                          help='Agile board id for sprint resolution (default: DEFAULT_BOARDS[project], else the project\'s only scrum board).')
     p_create.add_argument("--markdown", action="store_true",
                           help="Treat --description as markdown-lite (headings, bullet lists, **bold**, `code`).")
 
@@ -638,7 +657,7 @@ def main() -> None:
     p_edit.add_argument("--sprint", default=None,
                         help='Move to a sprint: a numeric sprint id, "active", "next", or a sprint name (case-insensitive, partial match accepted).')
     p_edit.add_argument("--board", default=None, type=int,
-                        help='Agile board id to use for sprint resolution (overrides auto-discovery from project key).')
+                        help='Agile board id for sprint resolution (default: DEFAULT_BOARDS[project], else the project\'s only scrum board).')
     p_edit.add_argument("--markdown", action="store_true",
                         help="Treat --description as markdown-lite (headings, bullet lists, **bold**, `code`).")
 
